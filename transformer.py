@@ -2,18 +2,19 @@
 """
 
 import argparse
+import copy
 import json
 import logging
 import os
 import tempfile
-from typing import Optional
+from typing import Optional, Union
 import numpy as np
-import dateutil.parser
 import yaml
+import dateutil.parser
 from osgeo import gdal, osr, ogr
 
 
-import transformer_class  # pylint: disable=import-error
+import transformer_class
 
 # The image file name extensions we support
 SUPPORTED_IMAGE_EXTS = [".tif", ".tiff"]
@@ -32,33 +33,29 @@ TRAIT_NAME_MAP = {
 }
 
 
-def get_epsg(filename):
+def get_epsg(filename: str) -> Optional[str]:
     """Returns the EPSG of the georeferenced image file
     Args:
-        filename(str): path of the file to retrieve the EPSG code from
+        filename: path of the file to retrieve the EPSG code from
     Return:
         Returns the found EPSG code, or None if it's not found or an error ocurred
     """
-    logger = logging.getLogger(__name__)
-
     try:
         src = gdal.Open(filename)
 
         proj = osr.SpatialReference(wkt=src.GetProjection())
 
         return proj.GetAttrValue('AUTHORITY', 1)
-    # pylint: disable=broad-except
     except Exception as ex:
-        logger.warn("[get_epsg] Exception caught: %s", str(ex))
-    # pylint: enable=broad-except
+        logging.warning("[get_epsg] Exception caught: %s", str(ex))
 
     return None
 
 
-def get_image_file_geobounds(filename):
+def get_image_file_geobounds(filename: str) -> list:
     """Uses gdal functionality to retrieve rectilinear boundaries from the file
     Args:
-        filename(str): path of the file to get the boundaries from
+        filename: path of the file to get the boundaries from
     Returns:
         The upper-left and calculated lower-right boundaries of the image in a list upon success.
         The values are returned in following order: min_y, max_y, min_x, max_x. A list of numpy.nan
@@ -97,10 +94,10 @@ def get_fields() -> list:
             'citation_author', 'citation_year', 'citation_title', 'method']
 
 
-def get_default_trait(trait_name: str):
+def get_default_trait(trait_name: str) -> Union[str, list]:
     """Returns the default value for the trait name
     Args:
-       trait_name(str): the name of the trait to return the default value for
+       trait_name: the name of the trait to return the default value for
     Return:
         If the default value for a trait is configured, that value is returned. Otherwise
         an empty string is returned.
@@ -109,13 +106,12 @@ def get_default_trait(trait_name: str):
     global TRAIT_NAME_ARRAY_VALUE
     global TRAIT_NAME_MAP
 
-    # pylint: disable=no-else-return
     if trait_name in TRAIT_NAME_ARRAY_VALUE:
         return []  # Return an empty list when the name matches
-    elif trait_name in TRAIT_NAME_MAP:
+    if trait_name in TRAIT_NAME_MAP:
         return TRAIT_NAME_MAP[trait_name]
-    else:
-        return ""
+
+    return ""
 
 
 def get_traits_table() -> list:
@@ -152,6 +148,43 @@ def generate_traits_list(traits: list) -> list:
             trait_list.append(get_default_trait(field_name))
 
     return trait_list
+
+
+def setup_default_traits(traits: dict, args: argparse.Namespace, full_md: list) -> dict:
+    """Overrides trait values based upon command line parameters and loaded metadata
+    Arguments:
+        traits: the current set of traits
+        args: command line arguments which may override values
+        full_md: the loaded metadata which is checked for default values
+    Return:
+        A copy of the traits with updated values, or the original traits if nothing was changed
+    """
+    new_traits = copy.deepcopy(traits)
+    traits_modified = False
+
+    # Check metadata
+    if full_md:
+        for one_md in full_md:
+            if 'germplasmName' in one_md:
+                new_traits['species'] = one_md['germplasmName']
+                traits_modified = True
+
+    # Check command line parameters
+    if args.germplasmName is not None:
+        new_traits['species'] = args.germplasmName
+        traits_modified = True
+    if args.citationAuthor is not None:
+        new_traits['citation_author'] = args.citationAuthor
+        traits_modified = True
+    if args.citationTitle is not None:
+        new_traits['citation_title'] = args.citationTitle
+        traits_modified = True
+    if args.citationYear is not None:
+        new_traits['citation_year'] = args.citationYear
+        traits_modified = True
+
+    # Return the appropriate traits
+    return new_traits if traits_modified else traits
 
 
 def calculate_canopycover_masked(pxarray: np.ndarray) -> float:
@@ -246,12 +279,12 @@ def get_image_bounds(image_file: str) -> Optional[str]:
     return None
 
 
-def get_spatial_reference_from_json(geojson: str):
-    """Returns the spatial reference embeddeed in the geojson.
+def get_spatial_reference_from_json(geojson: str) -> osr.SpatialReference:
+    """Returns the spatial reference embedded in the geojson.
     Args:
         geojson(str): the geojson to get the spatial reference from
     Return:
-        The osr.SpatialReference that represents the geographics coordinate system
+        The osr.SpatialReference that represents the geographic coordinate system
         in the geojson. None is returned if a spatial reference isn't found
     """
     yaml_geom = yaml.safe_load(geojson)
@@ -260,7 +293,15 @@ def get_spatial_reference_from_json(geojson: str):
     if current_geom:
         return current_geom.GetSpatialReference()
 
-    raise RuntimeError("Specified JSON does not have a valid sptial reference")
+    raise RuntimeError("Specified JSON does not have a valid spatial reference")
+
+
+def centroid_from_geojson(geojson: str) -> str:
+    """Return centroid lat/lon of a geojson object."""
+    geom_poly = ogr.CreateGeometryFromJson(geojson)
+    centroid = geom_poly.Centroid()
+
+    return centroid.ExportToJson()
 
 
 def add_parameters(parser: argparse.ArgumentParser) -> None:
@@ -269,23 +310,18 @@ def add_parameters(parser: argparse.ArgumentParser) -> None:
         parser: instance of argparse
     """
     parser.add_argument('--citation_author', dest="citationAuthor", type=str, nargs='?',
-                        default="Unknown",
                         help="author of citation to use when generating measurements")
 
     parser.add_argument('--citation_title', dest="citationTitle", type=str, nargs='?',
-                        default="Unknown",
                         help="title of the citation to use when generating measurements")
 
     parser.add_argument('--citation_year', dest="citationYear", type=str, nargs='?',
-                        default="Unknown",
                         help="year of citation to use when generating measurements")
 
     parser.add_argument('--germplasm_name', dest="germplasmName", type=str, nargs='?',
-                        default="Unknown",
                         help="name of the germplasm associated with the canopy cover")
 
 
-# pylint: disable=unused-argument
 def check_continue(transformer: transformer_class.Transformer, check_md: dict,
                    transformer_md: dict, full_md: dict) -> tuple:
     """Checks if conditions are right for continuing processing
@@ -298,8 +334,9 @@ def check_continue(transformer: transformer_class.Transformer, check_md: dict,
         Returns a tuple containing the return code for continuing or not, and
         an error message if there's an error
     """
+    # pylint: disable=unused-argument
     # Check that we have what we need
-    if not 'list_files' in check_md:
+    if 'list_files' not in check_md:
         return (-1, "Unable to find list of files associated with this request")
 
     # Make sure there's a tiff file to process
@@ -315,14 +352,6 @@ def check_continue(transformer: transformer_class.Transformer, check_md: dict,
     return (0) if found_file else (-1, "Unable to find an image file to work with")
 
 
-def centroid_from_geojson(geojson):
-    """Return centroid lat/lon of a geojson object."""
-    geom_poly = ogr.CreateGeometryFromJson(geojson)
-    centroid = geom_poly.Centroid()
-
-    return centroid.ExportToJson()
-
-
 def perform_process(transformer: transformer_class.Transformer, check_md: dict,
                     transformer_md: dict, full_md: dict) -> dict:
     """Performs the processing of the data
@@ -334,6 +363,8 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict,
     Return:
         Returns a dictionary with the results of processing
     """
+    # Disable pylint checks that would reduce readability
+    # pylint: disable=unused-argument,too-many-locals,too-many-branches,too-many-statements
     # Setup local variables
     timestamp = dateutil.parser.parse(check_md['timestamp'])
     datestamp = timestamp.strftime("%Y-%m-%d")
@@ -347,17 +378,10 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict,
     (fields, traits) = get_traits_table()
 
     # Setup default trait values
-    if transformer.args.germplasmName is not None:
-        traits['species'] = transformer.args.germplasmName
-    if transformer.args.citationAuthor is not None:
-        traits['citation_author'] = transformer.args.citationAuthor
-    if transformer.args.citationTitle is not None:
-        traits['citation_title'] = transformer.args.citationTitle
-    if transformer.args.citationYear is not None:
-        traits['citation_year'] = transformer.args.citationYear
-    else:
-        traits['citation_year'] = timestamp.year
+    traits['citation_year'] = timestamp.year
+    traits = setup_default_traits(traits, transformer.args, full_md)
 
+    # Preparing and writing headers
     geo_csv_header = ','.join(['site', 'trait', 'lat', 'lon', 'dp_time',
                                'source', 'value', 'timestamp'])
     bety_csv_header = ','.join(map(str, fields))
@@ -365,9 +389,6 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict,
         geo_file.write(geo_csv_header + "\n")
     if bety_file:
         bety_file.write(bety_csv_header + "\n")
-
-#    all_plots = get_site_boundaries(datestamp, city='Maricopa')
-#    logging.debug("Found %s plots for date %s", str(len(all_plots)), str(datestamp))
 
     # Loop through finding all image files
     image_exts = SUPPORTED_IMAGE_EXTS
@@ -385,25 +406,13 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict,
             logging.info("Image file does not appear to be geo-referenced '%s'", one_file)
             continue
 
-#        overlap_plots = find_plots_intersect_boundingbox(image_bounds, all_plots, fullmac=True)
-#        num_plots = len(overlap_plots)
-
-#        if not num_plots or num_plots < 0:
-#            logging.info("No plots intersect file '%s'", one_file)
-#            continue
         overlap_plots = [os.path.basename(os.path.dirname(one_file))]
 
         num_files += 1
-        image_spatial_ref = get_spatial_reference_from_json(image_bounds)
         for plot_name in overlap_plots:
-#            plot_bounds = convert_json_geometry(overlap_plots[plot_name], image_spatial_ref)
-#            tuples = geojson_to_tuples_betydb(yaml.safe_load(plot_bounds))
             centroid = json.loads(centroid_from_geojson(image_bounds))["coordinates"]
 
             try:
-#                logging.debug("Clipping raster to plot")
-#                pxarray = clip_raster(one_file, tuples, os.path.join(check_md['working_folder'],
-#                                                                     "temp.tif"))
                 raster = gdal.Open(one_file)
                 pxarray = np.array(raster.ReadAsArray())
                 if pxarray is not None:
